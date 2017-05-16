@@ -28,4 +28,7 @@ static void sp_nonblocking(int sock);
 #include "socket_kqueue.h"
 #endif
 
+#if defined(_WIN32) || defined(_WIN64)
+#include "socket_select.h"
+#endif
 #endif

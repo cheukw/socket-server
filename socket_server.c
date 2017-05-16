@@ -8,11 +8,19 @@
 
 #include "socket_server.h"
 #include "socket_poll.h"
+#if defined(_WIN32) || defined(_WIN64)
 
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <ws2ipdef.h>
+#pragma warning(disable:4996)
+#else
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/tcp.h>
 #include <unistd.h>
+#endif
+
 #include <errno.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -249,17 +257,27 @@ socket_keepalive(int fd) {
 	setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, (void *)&keepalive , sizeof(keepalive));
 }
 
+#if defined(_WIN32) || defined(_WIN64)
+#include <winnt.h>
+#define atomic_inc(x, val) InterlockedExchangeAddAcquire((x), (val))
+#define compare_and_swap(x, val1, val2) InterlockedCompareExchange((volatile LONG*)(x), (val1), (val2))
+#else
+#define atomic_inc(x, val) __sync_add_and_fetch((x), (val))
+#define compare_and_swap(x, val1, val2) __sync_bool_compare_and_swap((x), (val1), (val2))
+#endif
+
 static int
 reserve_id(struct socket_server *ss) {
 	int i;
 	for (i=0;i<MAX_SOCKET;i++) {
-		int id = __sync_add_and_fetch(&(ss->alloc_id), 1);
+
+		int id = atomic_inc(&(ss->alloc_id), 1);
 		if (id < 0) {
-			id = __sync_and_and_fetch(&(ss->alloc_id), 0x7fffffff);
+			id = atomic_inc(&(ss->alloc_id), 0x7fffffff);
 		}
 		struct socket *s = &ss->slot[HASH_ID(id)];
 		if (s->type == SOCKET_TYPE_INVALID) {
-			if (__sync_bool_compare_and_swap(&s->type, SOCKET_TYPE_INVALID, SOCKET_TYPE_RESERVE)) {
+			if (compare_and_swap(&s->type, SOCKET_TYPE_INVALID, SOCKET_TYPE_RESERVE)) {
 				s->id = id;
 				s->fd = -1;
 				return id;
@@ -277,6 +295,88 @@ clear_wb_list(struct wb_list *list) {
 	list->head = NULL;
 	list->tail = NULL;
 }
+#if defined(_WIN32) || defined(_WIN64)
+// copy from libev ev_win32.c
+static int pipe(int filedes[2]) {
+	struct sockaddr_in addr = { 0 };
+	int addr_size = sizeof(addr);
+	struct sockaddr_in adr2;
+	int adr2_size = sizeof(adr2);
+	SOCKET listener;
+	SOCKET sock[2] = { -1, -1 };
+
+	if ((listener = socket(AF_INET, SOCK_STREAM, 0)) == INVALID_SOCKET)
+		return -1;
+
+	addr.sin_family = AF_INET;
+	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	addr.sin_port = 0;
+
+	if (bind(listener, (struct sockaddr *)&addr, addr_size))
+		goto fail;
+
+	if (getsockname(listener, (struct sockaddr *)&addr, &addr_size))
+		goto fail;
+
+	if (listen(listener, 1))
+		goto fail;
+
+	if ((sock[0] = socket(AF_INET, SOCK_STREAM, 0)) == INVALID_SOCKET)
+		goto fail;
+
+	if (connect(sock[0], (struct sockaddr *)&addr, addr_size))
+		goto fail;
+
+	/* TODO: returns INVALID_SOCKET on winsock accept, not < 0. fix it */
+	/* when convenient, probably by just removing error checking altogether? */
+	if ((sock[1] = accept(listener, 0, 0)) < 0)
+		goto fail;
+
+	/* windows vista returns fantasy port numbers for sockets:
+	* example for two interconnected tcp sockets:
+	*
+	* (Socket::unpack_sockaddr_in getsockname $sock0)[0] == 53364
+	* (Socket::unpack_sockaddr_in getpeername $sock0)[0] == 53363
+	* (Socket::unpack_sockaddr_in getsockname $sock1)[0] == 53363
+	* (Socket::unpack_sockaddr_in getpeername $sock1)[0] == 53365
+	*
+	* wow! tridirectional sockets!
+	*
+	* this way of checking ports seems to work:
+	*/
+	if (getpeername(sock[0], (struct sockaddr *)&addr, &addr_size))
+		goto fail;
+
+	if (getsockname(sock[1], (struct sockaddr *)&adr2, &adr2_size))
+		goto fail;
+
+	errno = WSAEINVAL;
+	if (addr_size != adr2_size
+		|| addr.sin_addr.s_addr != adr2.sin_addr.s_addr /* just to be sure, I mean, it's windows */
+		|| addr.sin_port != adr2.sin_port)
+		goto fail;
+
+	closesocket(listener);
+
+	filedes[0] = sock[0];
+	filedes[1] = sock[1];
+
+	return 0;
+
+fail:
+	closesocket(listener);
+
+	if (sock[0] != INVALID_SOCKET) closesocket(sock[0]);
+	if (sock[1] != INVALID_SOCKET) closesocket(sock[1]);
+
+	return -1;
+}
+#define close(fd) closesocket(fd)
+#define write(fd, data, len) send(fd, data, len, 0)
+#define read(fd, data, len) recv(fd, data, len, 0)
+#else
+
+#endif
 
 struct socket_server *
 socket_server_create() {
@@ -471,7 +571,7 @@ open_socket(struct socket_server *ss, struct request_open * request, struct sock
 _failed:
 	freeaddrinfo( ai_list );
 	ss->slot[HASH_ID(id)].type = SOCKET_TYPE_INVALID;
-	return SOCKET_ERROR;
+	return SOCKET_ERROR_EX;
 }
 
 static int
@@ -775,7 +875,7 @@ _failed:
 	result->data = NULL;
 	ss->slot[HASH_ID(id)].type = SOCKET_TYPE_INVALID;
 
-	return SOCKET_ERROR;
+	return SOCKET_ERROR_EX;
 }
 
 static int
@@ -814,7 +914,7 @@ bind_socket(struct socket_server *ss, struct request_bind *request, struct socke
 	struct socket *s = new_fd(ss, id, request->fd, PROTOCOL_TCP, request->opaque, true);
 	if (s == NULL) {
 		result->data = NULL;
-		return SOCKET_ERROR;
+		return SOCKET_ERROR_EX;
 	}
 	sp_nonblocking(request->fd);
 	s->type = SOCKET_TYPE_BIND;
@@ -831,12 +931,12 @@ start_socket(struct socket_server *ss, struct request_start *request, struct soc
 	result->data = NULL;
 	struct socket *s = &ss->slot[HASH_ID(id)];
 	if (s->type == SOCKET_TYPE_INVALID || s->id !=id) {
-		return SOCKET_ERROR;
+		return SOCKET_ERROR_EX;
 	}
 	if (s->type == SOCKET_TYPE_PACCEPT || s->type == SOCKET_TYPE_PLISTEN) {
 		if (sp_add(ss->event_fd, s->fd, s)) {
 			s->type = SOCKET_TYPE_INVALID;
-			return SOCKET_ERROR;
+			return SOCKET_ERROR_EX;
 		}
 		s->type = (s->type == SOCKET_TYPE_PACCEPT) ? SOCKET_TYPE_CONNECTED : SOCKET_TYPE_LISTEN;
 		s->opaque = request->opaque;
@@ -858,7 +958,7 @@ setopt_socket(struct socket_server *ss, struct request_setopt *request) {
 		return;
 	}
 	int v = request->value;
-	setsockopt(s->fd, IPPROTO_TCP, request->what, &v, sizeof(v));
+	setsockopt(s->fd, IPPROTO_TCP, request->what, (const void*)&v, sizeof(v));
 }
 
 static void
@@ -925,7 +1025,7 @@ set_udp_address(struct socket_server *ss, struct request_setudp *request, struct
 		result->ud = 0;
 		result->data = NULL;
 
-		return SOCKET_ERROR;
+		return SOCKET_ERROR_EX;
 	}
 	if (type == PROTOCOL_UDP) {
 		memcpy(s->p.udp_address, request->address, 1+2+4);	// 1 type, 2 port, 4 ipv4
@@ -1005,7 +1105,7 @@ forward_message_tcp(struct socket_server *ss, struct socket *s, struct socket_me
 		default:
 			// close when error
 			force_close(ss, s, result);
-			return SOCKET_ERROR;
+			return SOCKET_ERROR_EX;
 		}
 		return -1;
 	}
@@ -1065,7 +1165,7 @@ forward_message_udp(struct socket_server *ss, struct socket *s, struct socket_me
 		default:
 			// close when error
 			force_close(ss, s, result);
-			return SOCKET_ERROR;
+			return SOCKET_ERROR_EX;
 		}
 		return -1;
 	}
@@ -1095,10 +1195,10 @@ static int
 report_connect(struct socket_server *ss, struct socket *s, struct socket_message *result) {
 	int error;
 	socklen_t len = sizeof(error);
-	int code = getsockopt(s->fd, SOL_SOCKET, SO_ERROR, &error, &len);
+	int code = getsockopt(s->fd, SOL_SOCKET, SO_ERROR, (void*)&error, &len);
 	if (code < 0 || error) {
 		force_close(ss,s, result);
-		return SOCKET_ERROR;
+		return SOCKET_ERROR_EX;
 	} else {
 		s->type = SOCKET_TYPE_CONNECTED;
 		result->opaque = s->opaque;
@@ -1161,7 +1261,7 @@ report_accept(struct socket_server *ss, struct socket *s, struct socket_message 
 
 static inline void
 clear_closed_event(struct socket_server *ss, struct socket_message * result, int type) {
-	if (type == SOCKET_CLOSE || type == SOCKET_ERROR) {
+	if (type == SOCKET_CLOSE || type == SOCKET_ERROR_EX) {
 		int id = result->id;
 		int i;
 		for (i=ss->event_index; i<ss->event_n; i++) {
